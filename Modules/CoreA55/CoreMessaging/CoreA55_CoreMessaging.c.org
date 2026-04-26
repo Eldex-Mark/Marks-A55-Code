@@ -1,0 +1,291 @@
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
+
+#include <pthread.h>
+
+#include "metal/alloc.h"
+#include "openamp/open_amp.h"
+#include <openamp/remoteproc.h>
+
+#include "platform_info.h"
+#include "rsc_table.h"
+
+#include "CoreA55_CoreMessaging.h"
+
+#include <openamp/rpmsg_virtio.h> // Required for casting
+#include <openamp/virtio.h>        // Required for virtio_device
+
+#define SHUTDOWN_MSG (0xEF56A55A)
+
+extern pthread_mutex_t mutex;
+extern pthread_cond_t cond;
+extern pthread_mutex_t rsc_mutex;   // if you added this in TestBench.c
+extern volatile sig_atomic_t force_stop;
+
+static void *Priv;
+static struct remoteproc *platform = NULL;
+static struct remoteproc *platform1 = NULL;
+static struct rpmsg_device *rpdev = NULL;
+
+static struct rpmsg_endpoint rp_ept = { 0 };
+static int rnum = 0;
+static int err_cnt = 0;
+static char *svc_name = NULL;
+
+static int shutdown_msg = SHUTDOWN_MSG;
+
+char test_payload [] = "This is a test clock/sync signal for MHU communication from A55 core.\n";
+
+
+
+extern void init_system ();
+extern void cleanup_system ();
+
+static void rpmsg_service_bind (struct rpmsg_device *rdev, const char *name, uint32_t dest);
+static void rpmsg_service_unbind (struct rpmsg_endpoint *ept);
+static int rpmsg_service_cb0 (struct rpmsg_endpoint *rp_ept, void *data, size_t len, uint32_t src, void *priv);
+static int payload_init (struct rpmsg_device *rdev);
+
+// Add these helper variables outside/above the app function for tracking
+static int last_irq_count = 0;
+//extern int irq_count; // Ensure your ISR increments a global 'irq_count'
+
+int app (struct rpmsg_device *rdev, void *priv, unsigned long svcno) {
+Priv = priv;
+    int ret = 0;
+    char *svc_name;
+    uint8_t status = 0;
+
+    // 1. SAFE Cast: This works because OpenAMP mapped this memory for you
+    struct rpmsg_virtio_device *rvdev = (struct rpmsg_virtio_device *)rdev;
+    
+    if (rvdev && rvdev->vdev && rvdev->vdev->func->get_status) {
+        status = rvdev->vdev->func->get_status(rvdev->vdev);
+    }
+
+    // 2. IRQ Count: Safe as long as irq_count is a global variable in your code
+    extern int irq_count; 
+    int initial_irqs = irq_count; 
+
+    LPRINTF("\n--- DEBUG START (SAFE) ---\n");
+    LPRINTF("DEBUG: Pre-EPT Virtio Status: 0x%02x\n", status);
+    LPRINTF("DEBUG: IRQ Count at app entry: %d\n", initial_irqs);
+    LPRINTF("--- DEBUG END ---\n\n");
+
+    // 3. REMOVED the physical register check to avoid Segmentation Fault.
+    // If you need hardware status, use 'devmem 0x11010100' from the Linux terminal.
+
+    if ( (ret = payload_init(rdev)) ) return ret;
+
+    if (svcno == 0) svc_name = (char *) CFG_RPMSG_SVC_NAME0;
+    else svc_name = (char *) CFG_RPMSG_SVC_NAME1;
+
+    LPRINTF("appENTER: priv=%p svcno=%lu svc_name='%s' ept_addr=%u\n",
+            priv, svcno, svc_name, APP_EPT_ADDR);
+    fflush(stdout);
+
+    // 4. Check if flood is happening RIGHT NOW (before EPT creation)
+    usleep(10000); // 10ms pause to see if counter jumps
+    if (irq_count > initial_irqs + 10) {
+        LPRINTF("!!! ALERT: FLOOD DETECTED before EPT creation. IRQ delta: %d\n", irq_count - initial_irqs);
+    }
+
+    ret = rpmsg_create_ept(&rp_ept, rdev, svc_name, APP_EPT_ADDR, RPMSG_ADDR_ANY,
+                           rpmsg_service_cb0, rpmsg_service_unbind);
+    
+    LPRINTF("A55: after rpmsg_create_ept: ret %d\n", ret);
+    
+    if (ret) { 
+        LPERROR("Failed to create RPMsg endpoint.\n"); 
+        return ret; 
+    }
+
+    LPRINTF("A55: ept created: addr=%u dest=%u\n", rp_ept.addr, rp_ept.dest_addr);
+    LPRINTF("RPMSG endpoint is created.\n");
+    fflush(stdout);
+
+    return 0;
+}
+
+
+static void rpmsg_service_bind(struct rpmsg_device *rdev,
+                              const char *name,
+                              uint32_t dest)
+{
+    LPRINTF("BIND: got name='%s' dest=%u (expected='%s')\n",
+            name ? name : "(null)", dest,
+            svc_name ? svc_name : "(null)");
+    fflush(stdout);
+
+    /* If you haven't picked a service yet, adopt what M33 announced */
+    if (!svc_name || !*svc_name) {
+        svc_name = (char*)name;
+        LPRINTF("BIND: adopting svc_name='%s'\n", svc_name);
+        fflush(stdout);
+    }
+
+    if (svc_name && name && strcmp(name, svc_name) != 0) {
+        LPERROR("BIND: unexpected service. got='%s' expected='%s'\n", name, svc_name);
+        fflush(stdout);
+        return;  // don't create an endpoint for the wrong service
+    }
+
+    int ret = rpmsg_create_ept(&rp_ept, rdev,
+                              svc_name,
+                              APP_EPT_ADDR,
+                              dest,
+                              rpmsg_service_cb0,
+                              rpmsg_service_unbind);
+
+    LPRINTF("BIND: rpmsg_create_ept ret=%d ept=%p\n", ret, (void*)&rp_ept);
+    fflush(stdout);
+}
+
+
+static void rpmsg_service_unbind (struct rpmsg_endpoint *ept) {
+    (void)ept;
+    rpmsg_destroy_ept( &rp_ept );
+    memset( &rp_ept, 0x0, sizeof( struct rpmsg_endpoint ) );
+}
+
+
+
+static int rpmsg_service_cb0 (struct rpmsg_endpoint *cb_rp_ept, void *data, size_t len, uint32_t src, void *priv) {
+    (void) cb_rp_ept; (void) src; (void) priv;
+
+    LPRINTF( " received reply: \'%s\' ( size %lu )\r\n", (char*)data, len );
+    rnum = 1;
+
+    return 0;
+}
+
+
+
+static int payload_init (struct rpmsg_device *rdev) {
+    int rpmsg_buf_size = 0;
+
+    if ( ( rpmsg_buf_size = rpmsg_virtio_get_buffer_size(rdev) ) <= 0 ) { return rpmsg_buf_size; } // Get the maximum buffer size of a rpmsg packet
+    LPRINTF( "RPMsg buffer-size: %d bytes\n", rpmsg_buf_size );
+    //payload = (uint8_t*) metal_allocate_memory( max_size ); //if (!payload) { LPERROR( "memory allocation failed.\n" ); return -ENOMEM; }
+
+    return 0;
+}
+
+static void init_cond(void)
+{
+    pthread_mutex_init(&mutex, NULL);
+    pthread_mutex_init(&rsc_mutex, NULL);
+    pthread_cond_init(&cond, NULL);
+}
+
+int CoreMessagingDriver_init () {
+    unsigned long proc_id = 0;
+    unsigned long rsc_id = 0;
+    int ret = 0;
+    
+    LPRINTF( "ENTER:CoreMessagingDriver_init ()\n" );
+    
+    init_system(); // Initialize HW system components
+    init_cond();
+
+    /* 1) One-time init of shared memory/resources on channel 0 */
+    LPRINTF("CALLING platform_init(proc_id=0, rsc_id=0) [prime shared resources]\n");
+    fflush(stdout);
+    
+    ret = platform_init(0, 0, &platform);
+
+    LPRINTF("RETURNED platform_init(0,0): ret=%d platform=%p\n", ret, (void*)platform);
+    fflush(stdout);
+
+    if (ret || !platform) {
+        LPERROR("Failed to initialize platform0 (shared resources).\n");
+        return -1;
+    }
+        
+    proc_id = 1;
+    rsc_id = proc_id;
+
+    LPRINTF("CALLING platform_init(proc_id=%lu, rsc_id=%lu)\n", proc_id, rsc_id);
+    fflush(stdout);
+    
+    ret = platform_init (proc_id, rsc_id, &platform1); // Initialize platform
+    
+    LPRINTF("RETURNED platform_init: ret=%d platform1=%p\n", ret, (void*)platform1);
+    fflush(stdout);    
+    
+    if (ret || !platform1) {
+        LPERROR("Failed to initialize platform.\n");
+        return -1;
+    }
+
+    LPRINTF("ENTER:platform_create_rpmsg_vdev()\n");
+    
+    LPRINTF("CoreMessagingDriver_init: proc_id=%lu svc_name='%s'\n", proc_id, svc_name);
+    fflush(stdout);
+    
+    rpdev = platform_create_rpmsg_vdev(platform, 0, VIRTIO_DEV_MASTER, NULL, rpmsg_service_bind);   
+
+    if (!rpdev) {
+        printf("A55: platform_create_rpmsg_vdev FAILED (channel 0)\n");
+    } else {
+        printf("A55: RPMsg vdev created OK: rpdev=%p\n", rpdev);
+    } 
+    fflush(stdout);
+     
+    LPRINTF("ENTER:app ()\n");
+    (void)app(rpdev, platform, proc_id);
+    return 0;
+}
+
+
+
+int CoreMessagingDriver_refresh () {
+    int ret = 0;
+    static int size = sizeof( test_payload );
+
+    static int counter;
+    test_payload[50] = (counter++) & 0x7F; //A55 allows change, why M33 doesn't then?
+
+//    ret = rpmsg_send( &rp_ept, test_payload, size );
+    
+    ret = rpmsg_sendto(&rp_ept, test_payload, size, APP_EPT_ADDR);
+    if (ret < 0) { LPRINTF( "Error sending data...%d\n", ret ); return -1; }
+    LPRINTF( "echo test: sent \'%s\' : %d  ret:%d\n", test_payload, size, ret );
+
+//    do { platform_poll( Priv ); } while (rnum == 0);
+//    rnum = 0;
+
+     int tries = 5000; // ~5 seconds if you sleep 1ms
+     while (rnum == 0 && tries--) {
+         platform_poll(Priv);
+         usleep(1000);
+     }
+     if (rnum == 0) {
+          LPRINTF("refresh: timeout waiting for RX");
+          return -ETIMEDOUT;
+    }
+    rnum = 0;
+
+
+
+    LPRINTF("EXIT: CoreMessaging_refresh\n");
+    
+    return 0;
+}
+
+
+
+void CoreMessagingDriver_close () {
+    rpmsg_send( &rp_ept, &shutdown_msg, sizeof(int) ); // Send shutdown message to remote
+    sleep( 1 );
+    LPRINTF( "Quitting application .. Echo test end\n" );
+    //metal_free_memory( payload );
+    platform_release_rpmsg_vdev( platform, rpdev );
+    LPRINTF( "Stopping application...\n" );
+    platform_cleanup( platform );
+    cleanup_system();
+}
+

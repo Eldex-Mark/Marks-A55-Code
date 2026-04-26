@@ -1,0 +1,110 @@
+message(STATUS "=== CMake actually runs! ===")
+
+cmake_minimum_required(VERSION 3.12)
+project(TestBench C)
+
+message(STATUS "Compiler: ${CMAKE_C_COMPILER}")
+message(STATUS "CFLAGS: ${CMAKE_C_FLAGS}")
+message(STATUS "Sysroot: ${CMAKE_SYSROOT}")
+
+
+# Detect if running inside Yocto environment
+if(DEFINED ENV{OECORE_NATIVE_SYSROOT} OR DEFINED ENV{OE_CMAKE_TOOLCHAIN_FILE})
+    set(SQUARELINE_BUILD_IN_YOCTO TRUE)
+    message(STATUS "Yocto environment detected.")
+else()
+    set(SQUARELINE_BUILD_IN_YOCTO FALSE)
+    message(STATUS "No Yocto environment detected; using manual toolchain.")
+endif()
+
+# Default build target flags (can be overridden externally)
+set(SQUARELINE_BUILD_TARGET__UNIX 0 CACHE INTERNAL "")
+set(SQUARELINE_BUILD_TARGET__WINDOWS 0 CACHE INTERNAL "")
+set(SQUARELINE_BUILD_TARGET__BOARD 0 CACHE INTERNAL "")
+set(SQUARELINE_BUILD_TARGET__BOARD__CORE_M33 0 CACHE INTERNAL "")
+set(SQUARELINE_BUILD_TARGET__BOARD__CORE_A55 0 CACHE INTERNAL "")
+set(SQUARELINE_BUILD_TARGET__EMSCRIPTEN 0 CACHE INTERNAL "")
+set(SQUARELINE_DEBUG 0 CACHE INTERNAL "")
+
+add_definitions(
+    -DSQUARELINE_BUILD_TARGET__UNIX=${SQUARELINE_BUILD_TARGET__UNIX}
+    -DSQUARELINE_BUILD_TARGET__WINDOWS=${SQUARELINE_BUILD_TARGET__WINDOWS}
+    -DSQUARELINE_BUILD_TARGET__BOARD=${SQUARELINE_BUILD_TARGET__BOARD}
+    -DSQUARELINE_BUILD_TARGET__BOARD__CORE_M33=${SQUARELINE_BUILD_TARGET__BOARD__CORE_M33}
+    -DSQUARELINE_BUILD_TARGET__BOARD__CORE_A55=${SQUARELINE_BUILD_TARGET__BOARD__CORE_A55}
+    -DSQUARELINE_BUILD_TARGET__EMSCRIPTEN=${SQUARELINE_BUILD_TARGET__EMSCRIPTEN}
+    -DSQUARELINE_DEBUG=${SQUARELINE_DEBUG}
+)
+
+set(CMAKE_C_STANDARD 11)
+set(CMAKE_CXX_STANDARD 11)
+set(CMAKE_C_FLAGS "-Wall -Wextra -Wno-unused -g")
+set(CMAKE_CXX_FLAGS ${CMAKE_C_FLAGS})
+
+# Include directories common to all builds
+include_directories(
+    ${PROJECT_SOURCE_DIR}
+    ${PROJECT_SOURCE_DIR}/Modules/Common
+    ${PROJECT_SOURCE_DIR}/Modules/Common/GUI_API
+    ${PROJECT_SOURCE_DIR}/Modules/Common/CoreMessaging
+)
+
+# Board-specific includes
+if(NOT SQUARELINE_BUILD_TARGET__BOARD__CORE_A55)
+    include_directories(${PROJECT_SOURCE_DIR}/Modules/CoreM33/CoreMessaging)
+endif()
+
+if(NOT SQUARELINE_BUILD_TARGET__BOARD__CORE_M33)
+    include_directories(
+        ${PROJECT_SOURCE_DIR}/Modules/CoreA55/CoreMessaging
+        ${PROJECT_SOURCE_DIR}/Modules/CoreA55/GUI
+    )
+endif()
+
+# Determine source files based on target
+if(NOT SQUARELINE_BUILD_TARGET__BOARD__CORE_M33 AND NOT SQUARELINE_BUILD_TARGET__BOARD__CORE_A55)
+    set(App_Sources TestBench.c CoreM33_Example.c CoreA55_Example.c)
+    file(GLOB_RECURSE GUI_Sources CONFIGURE_DEPENDS Modules/Common/*.c Modules/CoreA55/GUI/*.c)
+elseif(SQUARELINE_BUILD_TARGET__BOARD__CORE_A55)
+    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -O2 -g -DCFG_CA5X -Wno-type-limits -Wno-pointer-to-int-cast")
+    include_directories(${PROJECT_SOURCE_DIR}/Modules/CoreA55/OpenAMP_MHU)
+    set(App_Sources TestBench.c CoreA55_Example.c)
+    file(GLOB_RECURSE GUI_Sources CONFIGURE_DEPENDS Modules/Common/*.c Modules/CoreA55/*.c)
+    file(GLOB_RECURSE MHU_Sources CONFIGURE_DEPENDS Modules/CoreA55/CoreMessaging/*.c Modules/CoreA55/OpenAMP_MHU/*.c)
+elseif(SQUARELINE_BUILD_TARGET__BOARD__CORE_M33)
+    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -mthumb -mcmse -mcpu=cortex-m33+nodsp+nofp -O2 -g -ffunction-sections -fdata-sections")
+    include_directories(
+        ${PROJECT_SOURCE_DIR}/Modules/CoreM33/Renesas_MHU/src
+        ${PROJECT_SOURCE_DIR}/Modules/CoreM33/Renesas_MHU/rzg_cfg/aws
+        ${PROJECT_SOURCE_DIR}/Modules/CoreM33/Renesas_MHU/rzg_cfg/fsp_cfg
+        ${PROJECT_SOURCE_DIR}/Modules/CoreM33/Renesas_MHU/rzg_cfg/fsp_cfg/bsp
+        ${PROJECT_SOURCE_DIR}/Modules/CoreM33/rzg_gen
+        ${PROJECT_SOURCE_DIR}/Modules/CoreM33/rzg
+        ${PROJECT_SOURCE_DIR}/Modules/CoreM33/rzg/fsp/inc
+        ${PROJECT_SOURCE_DIR}/Modules/CoreM33/CoreMessaging
+        ${PROJECT_SOURCE_DIR}/Modules/Common/GUI_API
+    )
+    file(GLOB_RECURSE GUI_Sources CONFIGURE_DEPENDS Modules/Common/*.c Modules/CoreM33/*.c)
+    file(GLOB_RECURSE MHU_Sources CONFIGURE_DEPENDS Modules/CoreM33/CoreMessaging/*.c Modules/CoreM33/Renesas_MHU/src/*.c)
+    set(App_Sources TestBench.c)
+else()
+    message(FATAL_ERROR "Unsupported build target configuration")
+endif()
+
+# Do NOT manually set compiler variables if building inside Yocto
+if(NOT SQUARELINE_BUILD_IN_YOCTO)
+    # Example manual override if needed outside Yocto (adjust as necessary)
+    # set(CMAKE_C_COMPILER aarch64-poky-linux-gcc)
+    # set(CMAKE_CXX_COMPILER aarch64-poky-linux-g++)
+endif()
+
+
+add_executable(${PROJECT_NAME}
+    ${App_Sources}
+    ${GUI_Sources}
+    ${MHU_Sources}
+)
+
+
+
+
