@@ -187,7 +187,9 @@ static int app (struct rpmsg_device *rdev, struct remoteproc *priv, unsigned lon
         register_handler(SIGINT, stop_handler);
         register_handler(SIGTERM, stop_handler);
     }     
-      
+    
+    LPRINTF("RPMSG endpoint has created. rp_ept:%p ", &rp_ept); 
+    LPRINTF("force_stop: %d", force_stop);    
     while (!force_stop && !is_rpmsg_ept_ready(&rp_ept))
         platform_poll(priv);
 

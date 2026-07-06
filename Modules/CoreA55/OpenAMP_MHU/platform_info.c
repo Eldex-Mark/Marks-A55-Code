@@ -315,20 +315,27 @@ int platform_poll(struct remoteproc *rproc)
 {
 #ifdef __linux__
     unsigned int flags;
-    LPRINTF("ENTER: platform_poll\n");
-//    LPRINTF("^");
-    while(!force_stop) {
+    LPRINTF("platform_poll: enter\n");
+
+    while (!force_stop) {
         flags = metal_irq_save_disable();
+
         if (!(atomic_flag_test_and_set(&ipi.sync))) {
             metal_irq_restore_enable(flags);
+            LPRINTF("platform_poll: notification pending, calling remoteproc_get_notification\n");
             remoteproc_get_notification(rproc, RSC_NOTIFY_ID_ANY);
+            LPRINTF("platform_poll: notification handled, returning\n");
             break;
         }
+
         metal_irq_restore_enable(flags);
+
+        LPRINTF("platform_poll: sleeping waiting for IPI\n");
         pthread_mutex_lock(&mutex);
         pthread_cond_wait(&cond, &mutex);
         pthread_mutex_unlock(&mutex);
-    }
+        LPRINTF("platform_poll: woke from cond_wait\n");
+        }
 #else /* uC3 */
     (void) rproc;
 #endif
